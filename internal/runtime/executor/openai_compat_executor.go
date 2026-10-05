@@ -11,6 +11,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -1082,11 +1083,50 @@ func (e statusErr) IsCredentialScoped() bool   { return e.credentialScoped }
 
 const openAICompatTPMFallbackRetryAfter = time.Minute
 
+// minTokenHarborFreeCooldown floors the parsed window so clock skew or a reset
+// instant already in the past never produces a zero-length cooldown.
+const minTokenHarborFreeCooldown = time.Minute
+
+// tokenHarborFreeResetRe extracts the real reopening instant from a Token
+// Harbor free-tier rejection. The provider emits a generic Retry-After: 3600
+// even when the rolling window does not reopen for days, so the header alone
+// makes an exhausted credential retry hourly for nothing. The body is the only
+// trustworthy deadline:
+//
+//	"Your next rolling 7-day period starts on 11 Oct 2026 at 02:21 UTC."
+var tokenHarborFreeResetRe = regexp.MustCompile(
+	`(?i)next rolling [0-9]+-day period starts on ([0-9]{1,2} [A-Za-z]{3} [0-9]{4} at [0-9]{2}:[0-9]{2}) UTC`)
+
+// tokenHarborFreeResetDelay returns how long the exhausted credential should
+// stay cooled down, derived from the window text rather than the header.
+func tokenHarborFreeResetDelay(body []byte, now time.Time) *time.Duration {
+	match := tokenHarborFreeResetRe.FindSubmatch(body)
+	if len(match) < 2 {
+		return nil
+	}
+	deadline, errParse := time.ParseInLocation("2 Jan 2006 at 15:04", string(match[1]), time.UTC)
+	if errParse != nil {
+		return nil
+	}
+	delay := deadline.Sub(now)
+	if delay < minTokenHarborFreeCooldown {
+		delay = minTokenHarborFreeCooldown
+	}
+	return &delay
+}
+
 func newOpenAICompatStatusError(status int, headers http.Header, body []byte) statusErr {
+	retryAfter := openAICompatRetryAfter(status, headers, body, time.Now())
+	// An exhausted free-tier window is accounted per credential, not per model:
+	// the provider names its own reopening instant and every free model served
+	// by the same key draws on that one allowance. Cooling the whole credential
+	// keeps the pool from retrying sibling models on a key already out of quota.
+	credentialScoped := retryAfter != nil && tokenHarborFreeResetRe.Match(body)
 	return statusErr{
-		code:       status,
-		msg:        string(body),
-		retryAfter: openAICompatRetryAfter(status, headers, body, time.Now()),
+		code:             status,
+		msg:              string(body),
+		retryAfter:       retryAfter,
+		credentialScoped: credentialScoped,
 	}
 }
 
@@ -1097,6 +1137,11 @@ func newOpenAICompatStatusError(status int, headers http.Header, body []byte) st
 func openAICompatRetryAfter(status int, headers http.Header, body []byte, now time.Time) *time.Duration {
 	if status != http.StatusTooManyRequests {
 		return nil
+	}
+	// A window reset stated in the body outranks the generic Retry-After
+	// header, which understates a multi-day window as one hour.
+	if delay := tokenHarborFreeResetDelay(body, now); delay != nil {
+		return delay
 	}
 	if raw := strings.TrimSpace(headers.Get("Retry-After")); raw != "" {
 		if seconds, errParse := strconv.ParseInt(raw, 10, 64); errParse == nil && seconds >= 0 {
