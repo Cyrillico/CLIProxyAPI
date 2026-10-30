@@ -37,7 +37,10 @@ func TestResponsesCompatibilityDigest(t *testing.T) {
 		}
 	}
 	got := fmt.Sprintf("%x", hash.Sum(nil))
-	const want = "be3fc19eade4e6aff373fdfdd0192d586b5aa83e01a6b22884456396443f8411"
+	// Digest updated 2026-10-17: empty tool descriptions now get a "Tool <name>"
+	// placeholder because strict upstreams (OpenCode Zen free tier) require a
+	// non-empty function description.
+	const want = "fb97c9b342e4b407702c2a54655ed271caeb862e71aba9072c69b2c376db8568"
 	if got != want {
 		t.Fatalf("compatibility digest: got %s, want %s", got, want)
 	}

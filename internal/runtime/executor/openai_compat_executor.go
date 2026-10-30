@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -34,7 +35,7 @@ const (
 	openAICompatImagesGenerationsPath       = "/images/generations"
 	openAICompatImagesEditsPath             = "/images/edits"
 	openAICompatDefaultImageEndpoint        = openAICompatImagesGenerationsPath
-	openAICompatMultipartMemory       int64 = 32 << 20
+	openAICompatMultipartMemory int64 = 32 << 20
 )
 
 // OpenAICompatExecutor implements a stateless executor for OpenAI-compatible providers.
@@ -127,6 +128,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
+	translated = helps.FillEmptyOpenAIToolDescriptions(translated)
 	if helps.ShouldNormalizeOpenAIToolResultsForModel(e.resolveCompatConfig(auth, req), baseModel, requestedModel) {
 		translated = helps.NormalizeOpenAIToolResultsTextOnly(translated)
 	}
@@ -347,6 +349,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
+	translated = helps.FillEmptyOpenAIToolDescriptions(translated)
 	if helps.ShouldNormalizeOpenAIToolResultsForModel(e.resolveCompatConfig(auth, req), baseModel, requestedModel) {
 		translated = helps.NormalizeOpenAIToolResultsTextOnly(translated)
 	}
@@ -436,7 +439,48 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		var streamAborted bool
 		var upstreamEvent string
 		var frameData [][]byte
+		hold := &openAICompatStreamHold{}
 		defer streamUsage.Publish(ctx, reporter)
+
+		sendChunk := func(chunk cliproxyexecutor.StreamChunk) bool {
+			select {
+			case out <- chunk:
+				return true
+			case <-ctx.Done():
+				streamAborted = true
+				return false
+			}
+		}
+		flushHold := func() bool {
+			if hold.released {
+				return true
+			}
+			for _, payload := range hold.chunks {
+				if !sendChunk(cliproxyexecutor.StreamChunk{Payload: payload}) {
+					return false
+				}
+			}
+			hold.clear()
+			hold.released = true
+			return true
+		}
+		stagePayload := func(payload []byte) bool {
+			if len(payload) == 0 {
+				return true
+			}
+			if openAICompatPayloadHasTerminalSuccess(payload) {
+				hold.sawTerminal = true
+			}
+			// Release on the first event so the client and new-api see the real
+			// first token. Transport retries stay available only until then;
+			// holding the rest of the generation would make first-token time
+			// equal the total wait.
+			if hold.released {
+				return sendChunk(cliproxyexecutor.StreamChunk{Payload: payload})
+			}
+			hold.append(payload)
+			return flushHold()
+		}
 
 		publishStreamError := func(streamErr statusErr, containsPayload bool) {
 			loggedErr := streamErr
@@ -445,9 +489,15 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			}
 			helps.RecordAPIResponseError(ctx, e.cfg, loggedErr)
 			reporter.PublishFailure(ctx, loggedErr)
-			select {
-			case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
-			case <-ctx.Done():
+			if !hold.released && openAICompatRetryBeforeCommit(streamErr) {
+				hold.clear()
+			} else if !flushHold() {
+				streamFailed = true
+				return
+			}
+			if !sendChunk(cliproxyexecutor.StreamChunk{Err: streamErr}) {
+				streamFailed = true
+				return
 			}
 			streamFailed = true
 		}
@@ -494,10 +544,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, helps.ApplyPatchOriginalRequest(req, opts), translated, streamLine, &param, claudeInputTokens)
 			helps.RecordApplyPatchStreamFailure(ctx, param, reporter, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage})
 			for i := range chunks {
-				select {
-				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
-				case <-ctx.Done():
-					streamAborted = true
+				if !stagePayload(chunks[i]) {
 					return true
 				}
 			}
@@ -507,6 +554,9 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			}
 			if isDone {
 				seenDone = true
+				if !flushHold() {
+					return true
+				}
 				return true
 			}
 			return false
@@ -545,40 +595,48 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		if errScan == nil && !seenDone && !streamFailed && !streamAborted && len(frameData) > 0 {
 			_ = processFrame()
 		}
-		if !streamFailed && !streamAborted && helps.EndApplyPatchStream(ctx, param, reporter, out, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}) {
-			return
-		}
 		if streamFailed || streamAborted {
 			return
 		}
+
+		// A transport failure before any event is released stays retryable.
+		// After the first event the bytes are already downstream, so the
+		// error is appended and the first-token clock stays honest.
+		var pendingErr error
+		commitHold := true
 		if errScan != nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-			reporter.PublishFailure(ctx, errScan)
-			select {
-			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
-			case <-ctx.Done():
+			pendingErr = errScan
+			if !hold.released && openAICompatRetryBeforeCommit(errScan) {
+				commitHold = false
 			}
-		} else if !seenDone {
-			// Responses clients require an explicit terminal event. Treat a clean
-			// upstream EOF without [DONE] as a failed stream instead of completing it.
-			if responseFormat == sdktranslator.FormatOpenAIResponse {
-				streamErr := statusErr{code: http.StatusBadGateway, msg: "upstream stream closed before [DONE]"}
-				helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
-				reporter.PublishFailure(ctx, streamErr)
-				select {
-				case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
-				case <-ctx.Done():
-				}
+		} else if !seenDone && responseFormat == sdktranslator.FormatOpenAIResponse && !hold.sawTerminal {
+			pendingErr = statusErr{code: http.StatusBadGateway, msg: "upstream stream closed before [DONE]"}
+			if !hold.released {
+				commitHold = false
+			}
+		}
+		if commitHold {
+			if !flushHold() {
 				return
 			}
-
+			if helps.EndApplyPatchStream(ctx, param, reporter, out, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}) {
+				return
+			}
+		} else {
+			hold.clear()
+		}
+		if pendingErr != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, pendingErr)
+			reporter.PublishFailure(ctx, pendingErr)
+			_ = sendChunk(cliproxyexecutor.StreamChunk{Err: pendingErr})
+			return
+		}
+		if !seenDone && responseFormat != sdktranslator.FormatOpenAIResponse {
 			// Other protocols retain compatibility with providers that omit [DONE].
 			chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, helps.ApplyPatchOriginalRequest(req, opts), translated, []byte("data: [DONE]"), &param, claudeInputTokens)
 			helps.RecordApplyPatchStreamFailure(ctx, param, reporter, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage})
 			for i := range chunks {
-				select {
-				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
-				case <-ctx.Done():
+				if !sendChunk(cliproxyexecutor.StreamChunk{Payload: chunks[i]}) {
 					return
 				}
 			}
@@ -1026,6 +1084,61 @@ func (e *OpenAICompatExecutor) overrideModel(payload []byte, model string) []byt
 		return payload
 	}
 	return helps.SetStringIfDifferent(payload, "model", model)
+}
+
+type openAICompatStreamHold struct {
+	chunks      [][]byte
+	size        int
+	released    bool
+	sawTerminal bool
+}
+
+func (h *openAICompatStreamHold) append(chunk []byte) {
+	if h == nil || h.released || len(chunk) == 0 {
+		return
+	}
+	h.chunks = append(h.chunks, bytes.Clone(chunk))
+	h.size += len(chunk)
+}
+
+func (h *openAICompatStreamHold) clear() {
+	if h == nil {
+		return
+	}
+	h.chunks = nil
+	h.size = 0
+}
+
+// openAICompatRetryBeforeCommit reports transport failures that can be retried
+// on another credential when no bytes have been released downstream.
+func openAICompatRetryBeforeCommit(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "unexpected eof"):
+		return true
+	case strings.Contains(msg, "connection reset"):
+		return true
+	case strings.Contains(msg, "broken pipe"):
+		return true
+	case strings.Contains(msg, "closed before [done]"):
+		return true
+	case strings.Contains(msg, "incomplete sse"):
+		return true
+	case strings.Contains(msg, "incomplete data"):
+		return true
+	default:
+		return false
+	}
+}
+
+func openAICompatPayloadHasTerminalSuccess(payload []byte) bool {
+	return bytes.Contains(payload, []byte("response.completed")) || bytes.Contains(payload, []byte("response.done"))
 }
 
 func openAICompatErrorEvent(eventName string) bool {

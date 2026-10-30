@@ -218,6 +218,11 @@ func convertResponsesCustomToolToOpenAIChat(tool gjson.Result, overrideName stri
 	chatTool, _ = sjson.SetBytes(chatTool, "function.name", name)
 	if description := responsesToolDescription(tool); description != "" {
 		chatTool, _ = sjson.SetBytes(chatTool, "function.description", description)
+	} else {
+		// Strict upstreams (e.g. OpenCode Zen free tier) require a non-empty
+		// function description even though the OpenAI Responses API treats it
+		// as optional; keep a placeholder so the request is not rejected.
+		chatTool, _ = sjson.SetBytes(chatTool, "function.description", "Tool "+name)
 	}
 	if applypatch.IsCustomTool(tool) {
 		chatTool, _ = sjson.SetBytes(chatTool, "function.description", applypatch.Description(tool))
@@ -245,6 +250,10 @@ func convertResponsesFunctionToolToOpenAIChat(tool gjson.Result, overrideName st
 	chatTool, _ = sjson.SetBytes(chatTool, "function.name", name)
 	if description := responsesToolDescription(tool); description != "" {
 		chatTool, _ = sjson.SetBytes(chatTool, "function.description", description)
+	} else {
+		// Strict upstreams require a non-empty function description; see the
+		// custom-tool branch above.
+		chatTool, _ = sjson.SetBytes(chatTool, "function.description", "Tool "+name)
 	}
 	if parameters := responsesToolParameters(tool); parameters.Exists() {
 		chatTool, _ = sjson.SetRawBytes(chatTool, "function.parameters", []byte(parameters.Raw))
