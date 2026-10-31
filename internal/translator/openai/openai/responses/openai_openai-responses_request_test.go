@@ -2645,3 +2645,113 @@ func TestApplyPatchChatRequestContractAndHistory(t *testing.T) {
 		t.Fatalf("history mismatch: %s", result.Raw)
 	}
 }
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_TrailingReasoningFromInterruptedTurnIsDropped(t *testing.T) {
+	// Codex resumed after an interrupted turn: the input replays history and ends
+	// with a bare reasoning item. The converted messages must not end with an
+	// empty assistant message, because strict upstreams (DeepSeek) reject them
+	// with 400 "The last message must have role=user".
+	inputJSON := []byte(`{
+		"model": "deepseek-v4.1-flash",
+		"input": [
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"do it"}]},
+			{"type":"reasoning","summary":[{"type":"summary_text","text":"need a tool call"}]},
+			{"type":"function_call","call_id":"call_a","name":"tool_a","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_a","output":"result_a"},
+			{"type":"reasoning","summary":[{"type":"summary_text","text":"resumed thought"}]}
+		]
+	}`)
+
+	out, err := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("deepseek-v4.1-flash", inputJSON, false)
+	if err != nil {
+		t.Fatalf("translate failed: %v", err)
+	}
+	messages := gjson.GetBytes(out, "messages").Array()
+
+	roles := make([]string, 0, len(messages))
+	for _, m := range messages {
+		roles = append(roles, m.Get("role").String())
+	}
+	if len(messages) != 3 {
+		t.Fatalf("expected 3 messages, got %d (%v): %s", len(messages), roles, out)
+	}
+	if roles[0] != "user" || roles[1] != "assistant" || roles[2] != "tool" {
+		t.Fatalf("expected history to end with tool, got %v (output=%s)", roles, out)
+	}
+	// Mid-history reasoning must still be replayed on the assistant tool_calls message.
+	if messages[1].Get("reasoning_content").String() != "need a tool call" {
+		t.Fatalf("expected mid-history reasoning preserved on assistant, got: %s", messages[1].Raw)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_TrailingReasoningAfterAssistantMessageIsDropped(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "deepseek-v4.1-flash",
+		"input": [
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]},
+			{"type":"reasoning","summary":[{"type":"summary_text","text":"interrupted"}]}
+		]
+	}`)
+
+	out, err := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("deepseek-v4.1-flash", inputJSON, false)
+	if err != nil {
+		t.Fatalf("translate failed: %v", err)
+	}
+	messages := gjson.GetBytes(out, "messages").Array()
+	if len(messages) != 2 {
+		t.Fatalf("expected 2 messages, got %d: %s", len(messages), out)
+	}
+	if messages[0].Get("role").String() != "user" || messages[1].Get("role").String() != "assistant" {
+		t.Fatalf("expected [user, assistant], got: %s", out)
+	}
+	if messages[1].Get("content.0.text").String() != "hello" {
+		t.Fatalf("assistant message must keep its content: %s", messages[1].Raw)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_ReasoningFollowedByUserIsKept(t *testing.T) {
+	// Reasoning that is followed by more history must keep its replay message.
+	inputJSON := []byte(`{
+		"model": "deepseek-v4.1-flash",
+		"input": [
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+			{"type":"reasoning","summary":[{"type":"summary_text","text":"mid-history thought"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+		]
+	}`)
+
+	out, err := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("deepseek-v4.1-flash", inputJSON, false)
+	if err != nil {
+		t.Fatalf("translate failed: %v", err)
+	}
+	messages := gjson.GetBytes(out, "messages").Array()
+	if len(messages) != 3 {
+		t.Fatalf("expected 3 messages, got %d: %s", len(messages), out)
+	}
+	if messages[1].Get("role").String() != "assistant" || messages[1].Get("reasoning_content").String() != "mid-history thought" {
+		t.Fatalf("expected mid-history reasoning replay kept, got: %s", messages[1].Raw)
+	}
+	if messages[2].Get("role").String() != "user" {
+		t.Fatalf("expected history to end with user, got: %s", out)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_TrimNeverEmptiesMessages(t *testing.T) {
+	// A request that carries nothing but reasoning still yields one message.
+	inputJSON := []byte(`{
+		"model": "deepseek-v4.1-flash",
+		"input": [
+			{"type":"reasoning","summary":[{"type":"summary_text","text":"only thought"}]}
+		]
+	}`)
+
+	out, err := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("deepseek-v4.1-flash", inputJSON, false)
+	if err != nil {
+		t.Fatalf("translate failed: %v", err)
+	}
+	messages := gjson.GetBytes(out, "messages").Array()
+	if len(messages) != 1 || messages[0].Get("role").String() != "assistant" {
+		t.Fatalf("expected the lone reasoning replay to survive, got: %s", out)
+	}
+}

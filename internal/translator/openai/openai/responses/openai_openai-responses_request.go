@@ -478,6 +478,7 @@ func convertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 			extraAmbiguous = append(extraAmbiguous, id)
 		}
 		messages = translatorcommon.AlignOpenAIToolCallMessages(messages, extraAmbiguous...)
+		messages = trimTrailingEmptyAssistantMessages(messages)
 		out, _ = sjson.SetRawBytes(out, "messages", translatorcommon.JoinRawArray(messages))
 	}
 
@@ -507,6 +508,35 @@ func convertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 	}
 
 	return out, drops.Err()
+}
+
+// trimTrailingEmptyAssistantMessages drops trailing assistant messages that carry
+// neither content nor tool calls. They are reasoning-replay artifacts: a Codex
+// session resumed after an interrupted turn ends its input with a bare reasoning
+// item, which appendPendingReasoningMessage turns into an assistant message with
+// empty content. Strict chat-completions upstreams (e.g. DeepSeek) require the
+// conversation to end with a user or tool message and reject these with 400
+// "The last message must have role=user". Reasoning followed by more history is
+// untouched; at least one message always remains.
+func trimTrailingEmptyAssistantMessages(messages [][]byte) [][]byte {
+	for len(messages) > 1 {
+		last := messages[len(messages)-1]
+		if gjson.GetBytes(last, "role").String() != "assistant" {
+			break
+		}
+		if toolCalls := gjson.GetBytes(last, "tool_calls"); toolCalls.Exists() && len(toolCalls.Array()) > 0 {
+			break
+		}
+		content := gjson.GetBytes(last, "content")
+		if content.Exists() && content.Type == gjson.String && content.String() != "" {
+			break
+		}
+		if content.Exists() && content.IsArray() && len(content.Array()) > 0 {
+			break
+		}
+		messages = messages[:len(messages)-1]
+	}
+	return messages
 }
 
 // responsesInputFileToChatPart maps a Responses input_file part onto a Chat
