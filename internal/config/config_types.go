@@ -1092,6 +1092,11 @@ type OpenAICompatibility struct {
 
 	// RequestScopedErrors configures custom classification rules for upstream errors.
 	RequestScopedErrors []RequestScopedErrorRule `yaml:"request-scoped-errors,omitempty" json:"request-scoped-errors,omitempty"`
+
+	// MaxRequestBytes caps the serialized outbound payload for this provider.
+	// Requests exceeding the cap are rejected locally with a sanitized 413
+	// before any upstream contact; 0 (default) disables the check.
+	MaxRequestBytes int64 `yaml:"max-request-bytes,omitempty" json:"max-request-bytes,omitempty"`
 }
 
 // OpenAICompatibilityAPIKey represents an API key configuration with optional proxy setting.

@@ -186,6 +186,9 @@ func (e *OpenAICompatExecutor) executeWithCredentials(ctx context.Context, auth 
 	translated = doc.Bytes()
 	translated = helps.FillEmptyOpenAIToolDescriptions(translated)
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
+	if errLimit := e.checkOpenAICompatPayloadLimit(ctx, compat, translated); errLimit != nil {
+		return resp, errLimit
+	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
 	if err != nil {
 		return resp, err
@@ -429,6 +432,9 @@ func (e *OpenAICompatExecutor) executeStreamWithCredentials(ctx context.Context,
 	translated = doc.Bytes()
 	translated = helps.FillEmptyOpenAIToolDescriptions(translated)
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
+	if errLimit := e.checkOpenAICompatPayloadLimit(ctx, compat, translated); errLimit != nil {
+		return nil, errLimit
+	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
 	if err != nil {
 		return nil, err
@@ -1158,6 +1164,7 @@ func (e *OpenAICompatExecutor) resolveCompatConfig(auth *cliproxyauth.Auth, req 
 		var options struct {
 			SupportPromptCacheKey bool                              `json:"support-prompt-cache-key"`
 			Models                []config.OpenAICompatibilityModel `json:"models"`
+			MaxRequestBytes       int64                             `json:"max-request-bytes"`
 		}
 		present := false
 		if rawOptions, exists := auth.Metadata["credential_options"]; exists {
@@ -1180,6 +1187,7 @@ func (e *OpenAICompatExecutor) resolveCompatConfig(auth *cliproxyauth.Auth, req 
 				Name:                  auth.Attributes["compat_name"],
 				SupportPromptCacheKey: options.SupportPromptCacheKey,
 				Models:                options.Models,
+				MaxRequestBytes:       options.MaxRequestBytes,
 			}
 		}
 	}
@@ -1336,6 +1344,27 @@ func tokenHarborFreeResetDelay(body []byte, now time.Time) *time.Duration {
 		delay = minTokenHarborFreeCooldown
 	}
 	return &delay
+}
+
+// checkOpenAICompatPayloadLimit rejects outbound chat payloads whose serialized
+// size exceeds the provider's max-request-bytes cap before the upstream is
+// contacted. The client receives a fast, provider-agnostic 413 instead of the
+// upstream's own rejection, and no credential is rotated or penalized because
+// 413 classifies as a request fault. A non-positive cap disables the check.
+func (e *OpenAICompatExecutor) checkOpenAICompatPayloadLimit(ctx context.Context, compat *config.OpenAICompatibility, payload []byte) error {
+	if compat == nil || compat.MaxRequestBytes <= 0 || len(payload) <= int(compat.MaxRequestBytes) {
+		return nil
+	}
+	limitMB := fmt.Sprintf("%.1f MB", float64(compat.MaxRequestBytes)/1e6)
+	payloadMB := fmt.Sprintf("%.1f MB", float64(len(payload))/1e6)
+	helps.LogWithRequestID(ctx).Warnf("openai compat executor: provider %s rejecting outbound payload %s (%d bytes) over max-request-bytes %s (%d bytes) before upstream contact",
+		e.provider, payloadMB, len(payload), limitMB, compat.MaxRequestBytes)
+	return statusErr{
+		code: http.StatusRequestEntityTooLarge,
+		msg: fmt.Sprintf("request too large: this conversation is %s, over the %s limit of the current endpoint; start a new session or compact the conversation (e.g. /compact), remove screenshots and large attachments, then retry. 请求体积超过当前端点上限,请新开会话或压缩上下文(如 /compact),移除截图与大附件后重试。",
+			payloadMB, limitMB),
+		diagnostic: fmt.Sprintf("provider=%s payload_bytes=%d limit_bytes=%d", e.provider, len(payload), compat.MaxRequestBytes),
+	}
 }
 
 func newOpenAICompatStatusError(status int, headers http.Header, body []byte) statusErr {
